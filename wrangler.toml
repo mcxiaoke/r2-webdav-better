@@ -4,13 +4,29 @@ name = "r2-webdav"
 
 compatibility_flags = ["nodejs_compat"]
 
+# Custom domain for the Worker.
+# NOTE: `custom_domains` is NOT a valid top-level wrangler field (wrangler's schema
+# sets additionalProperties = false and will warn/ignore it). A custom domain is
+# expressed as a route with `custom_domain = true`.
+# The zone (umao.top) must live in the same Cloudflare account; deploying creates
+# the DNS record and the certificate automatically.
+# Keep this block above every [table] header, otherwise TOML would nest the key.
+routes = [{ pattern = "mydav.umao.top", custom_domain = true }]
+
 # Bind an R2 Bucket. Use R2 to store arbitrarily large blobs of data, such as files.
 # Docs: https://developers.cloudflare.com/r2/api/workers/workers-api-usage/
+# The binding name MUST stay "bucket": src/index.ts does `const { bucket } = env`.
 [[r2_buckets]]
-binding = "bucket" # <~ valid JavaScript variable name
-bucket_name = "webdav"
+binding = "bucket"
+bucket_name = "mydav"
 
 # Docs: https://developers.cloudflare.com/workers/observability/logs/workers-logs/#enable-workers-logs
 [observability]
 enabled = true
 head_sampling_rate = 1
+
+# Listen on all interfaces so that WSL2 (172.23.96.0/20) can reach the dev server.
+# Without this, wrangler defaults to "localhost" (127.0.0.1) and only the host can connect.
+# Host is reachable from WSL at: http://172.23.96.1:8787/
+[dev]
+ip = "0.0.0.0"
