@@ -40,6 +40,72 @@ async function* listAll(bucket: R2Bucket, prefix: string, isRecursive: boolean =
 	} while (r2_objects.truncated);
 }
 
+/**
+ * A direct member of a WebDAV collection.
+ *
+ * `collection` covers both explicit collections (a marker object written by
+ * MKCOL) and implicit ones that only exist as a key prefix.
+ */
+type DavMember = { kind: 'object'; object: R2Object } | { kind: 'collection'; key: string };
+
+/**
+ * Lists the direct members of a collection, including implicit collections.
+ *
+ * R2 has no directories: a key such as `photos/deep.txt` written straight into
+ * the bucket (dashboard, S3 API, `wrangler r2 object put`) implies the
+ * collection `photos/` even though no marker object was ever created for it.
+ * RFC 4918 §5.2 requires that collection to exist:
+ * "For all WebDAV-compliant resources A and B ... such that "V" is equal to
+ * "U/SEGMENT", A MUST be a collection that contains a mapping from "SEGMENT"
+ * to B." R2 returns those as `delimitedPrefixes`, which listAll() discards, so
+ * this function exists separately: listAll() is still used by the recursive
+ * LOCK / COPY / MOVE paths that must only ever see real R2 objects.
+ *
+ * `prefix` is either '' (the root collection) or a path ending with '/'.
+ */
+async function* listMembers(bucket: R2Bucket, prefix: string): AsyncGenerator<DavMember> {
+	let cursor: string | undefined = undefined;
+	// Path segments already reported, so that RFC 4918 §5.2 ("A collection MUST
+	// contain at most one mapping for a given path segment") holds even when a
+	// key is both a marker object and a key prefix.
+	let seen = new Set<string>();
+	do {
+		let page = await bucket.list({
+			prefix: prefix,
+			delimiter: '/',
+			cursor: cursor,
+			// @ts-ignore https://developers.cloudflare.com/r2/api/workers/workers-api-reference/#r2listoptions
+			include: ['httpMetadata', 'customMetadata'],
+		});
+
+		// Objects first so that a marker object (explicit collection) and a plain
+		// object always win over a same-named implicit collection.
+		for (let object of page.objects) {
+			if (seen.has(object.key)) {
+				continue;
+			}
+			seen.add(object.key);
+
+			if (object.customMetadata?.resourcetype === '<collection />') {
+				yield { kind: 'collection', key: object.key };
+			} else {
+				yield { kind: 'object', object: object };
+			}
+		}
+
+		for (let delimitedPrefix of page.delimitedPrefixes) {
+			let key = delimitedPrefix.endsWith('/') ? delimitedPrefix.slice(0, -1) : delimitedPrefix;
+			if (seen.has(key)) {
+				continue;
+			}
+			seen.add(key);
+			yield { kind: 'collection', key: key };
+		}
+
+		cursor = page.truncated ? page.cursor : undefined;
+	} while (cursor !== undefined);
+}
+
 type DavProperties = {
 	creationdate: string | undefined;
 	displayname: string | undefined;
@@ -170,6 +236,19 @@ async function hasCollectionResource(bucket: R2Bucket, resourcePath: string): Pr
 		limit: 1,
 	});
 	return descendants.objects.length > 0;
+}
+
+/**
+ * Writes the marker object that represents an explicit collection.
+ *
+ * Uses the same representation as MKCOL: an empty object whose key is the
+ * collection path without the trailing slash and whose `resourcetype`
+ * custom metadata marks it as a collection.
+ */
+async function writeCollectionMarker(bucket: R2Bucket, resourcePath: string): Promise<void> {
+	await bucket.put(resourcePath, new Uint8Array(), {
+		customMetadata: { resourcetype: '<collection />' },
+	});
 }
 
 function parseDestinationPath(destinationHeader: string, requestUrl: string): string | null {
@@ -923,8 +1002,9 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 
 	if (request.url.endsWith('/')) {
 		if (resource_path !== '') {
-			let resource = await bucket.head(resource_path);
-			if (resource === null || resource.customMetadata?.resourcetype !== '<collection />') {
+			// A collection may also exist implicitly, as a key prefix with no marker
+			// object behind it. hasCollectionResource() covers both cases.
+			if (!(await hasCollectionResource(bucket, resource_path))) {
 				return new Response('Not Found', { status: 404 });
 			}
 		}
@@ -936,14 +1016,17 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 			prefix = `${resource_path}/`;
 		}
 
-		for await (const object of listAll(bucket, prefix)) {
-			if (object.key === resource_path) {
-				continue;
+		for await (const member of listMembers(bucket, prefix)) {
+			let href: string;
+			let name: string;
+			if (member.kind === 'collection') {
+				href = getResourceHref(member.key, true);
+				name = member.key.slice(prefix.length);
+			} else {
+				href = getResourceHref(member.object.key, false);
+				name = member.object.httpMetadata?.contentDisposition ?? member.object.key.slice(prefix.length);
 			}
-			let href = getResourceHref(object.key, object.customMetadata?.resourcetype === '<collection />');
-			page += `<a href="${escapeXml(href)}">${escapeXml(
-				object.httpMetadata?.contentDisposition ?? object.key.slice(prefix.length),
-			)}</a><br>`;
+			page += `<a href="${escapeXml(href)}">${escapeXml(name)}</a><br>`;
 		}
 		// 定义模板
 		var pageSource = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>R2Storage</title><style>*{box-sizing:border-box;}body{padding:10px;font-family:'Segoe UI','Circular','Roboto','Lato','Helvetica Neue','Arial Rounded MT Bold','sans-serif';}a{display:inline-block;width:100%;color:#000;text-decoration:none;padding:5px 10px;cursor:pointer;border-radius:5px;}a:hover{background-color:#60C590;color:white;}a[href="../"]{background-color:#cbd5e1;}</style></head><body><h1>R2 Storage</h1><div>${page}</div></body></html>`;
@@ -1098,13 +1181,18 @@ async function handle_delete(request: Request, bucket: R2Bucket): Promise<Respon
 
 	let resource = await bucket.head(resource_path);
 	if (resource === null) {
-		return new Response('Not Found', { status: 404 });
-	}
-	if (resource.customMetadata?.resourcetype !== '<collection />') {
+		// No marker object, but the key may still exist implicitly as a prefix of
+		// other objects. Such a collection must be deletable too, otherwise it
+		// would be visible in PROPFIND yet impossible to remove.
+		if (!(await hasCollectionResource(bucket, resource_path))) {
+			return new Response('Not Found', { status: 404 });
+		}
+	} else if (resource.customMetadata?.resourcetype !== '<collection />') {
 		await bucket.delete(resource_path);
 		return new Response(null, { status: 204 });
 	}
 
+	// Collection: remove every descendant, then the marker object if there is one.
 	let r2_objects,
 		cursor: string | undefined = undefined;
 	do {
@@ -1122,7 +1210,9 @@ async function handle_delete(request: Request, bucket: R2Bucket): Promise<Respon
 		}
 	} while (r2_objects.truncated);
 
-	await bucket.delete(resource_path);
+	if (resource !== null) {
+		await bucket.delete(resource_path);
+	}
 	return new Response(null, { status: 204 });
 }
 
@@ -1156,9 +1246,27 @@ async function handle_mkcol(request: Request, bucket: R2Bucket): Promise<Respons
 	return new Response('', { status: 201 });
 }
 
-function generate_propfind_response(object: R2Object | null, propfindRequest: PropfindRequest): string {
+/**
+ * @param object the R2 object backing the resource, or null for the root
+ *   collection and for synthetic (implicit) collections.
+ * @param syntheticCollectionKey key of an implicit collection, i.e. a
+ *   directory that exists only as a key prefix and therefore has no R2 object
+ *   behind it. Properties are then derived from a null object, exactly like the
+ *   root collection, and only the href differs.
+ */
+function generate_propfind_response(
+	object: R2Object | null,
+	propfindRequest: PropfindRequest,
+	syntheticCollectionKey: string | null = null,
+): string {
+	let isCollection =
+		syntheticCollectionKey !== null || object?.customMetadata?.resourcetype === '<collection />';
 	let href =
-		object === null ? '/' : getResourceHref(object.key, object.customMetadata?.resourcetype === '<collection />');
+		object !== null
+			? getResourceHref(object.key, isCollection)
+			: syntheticCollectionKey !== null
+				? getResourceHref(syntheticCollectionKey, true)
+				: '/';
 	let deadProperties = getDeadProperties(object?.customMetadata);
 	let liveProperties = Object.entries(fromR2Object(object)).flatMap(([key, value]) =>
 		value === undefined ? [] : [renderDavProperty(key, value)],
@@ -1222,10 +1330,17 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 	} else {
 		let object = await bucket.head(resource_path);
 		if (object === null) {
-			return new Response('Not Found', { status: 404 });
+			// No marker object, but the key may still exist as a prefix of other
+			// objects (an implicit collection written straight into R2).
+			if (!(await hasCollectionResource(bucket, resource_path))) {
+				return new Response('Not Found', { status: 404 });
+			}
+			is_collection = true;
+			page += generate_propfind_response(null, propfindRequest, resource_path);
+		} else {
+			is_collection = object.customMetadata?.resourcetype === '<collection />';
+			page += generate_propfind_response(object, propfindRequest);
 		}
-		is_collection = object.customMetadata?.resourcetype === '<collection />';
-		page += generate_propfind_response(object, propfindRequest);
 	}
 
 	if (is_collection) {
@@ -1236,13 +1351,21 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 			case '1':
 				{
 					let prefix = resource_path === '' ? resource_path : resource_path + '/';
-					for await (let object of listAll(bucket, prefix)) {
-						page += generate_propfind_response(object, propfindRequest);
+					for await (let member of listMembers(bucket, prefix)) {
+						page +=
+							member.kind === 'object'
+								? generate_propfind_response(member.object, propfindRequest)
+								: generate_propfind_response(null, propfindRequest, member.key);
 					}
 				}
 				break;
 			case 'infinity':
 				{
+					// Intentionally still listAll(): a depth-infinity response is a flat
+					// list, and expanding implicit collections here would require every
+					// intermediate level to be synthesised as well. listAll() only ever
+					// yields real R2 objects, which is what the recursive LOCK / COPY /
+					// MOVE paths rely on too.
 					let prefix = resource_path === '' ? resource_path : resource_path + '/';
 					for await (let object of listAll(bucket, prefix, true)) {
 						page += generate_propfind_response(object, propfindRequest);
@@ -1396,11 +1519,16 @@ async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response
 	}
 
 	let resource = await bucket.head(resource_path);
+	let is_implicit_collection = false;
 	if (resource === null) {
-		return new Response('Not Found', { status: 404 });
+		// A collection may exist only as a key prefix, with no marker object.
+		if (!(await hasCollectionResource(bucket, resource_path))) {
+			return new Response('Not Found', { status: 404 });
+		}
+		is_implicit_collection = true;
 	}
 
-	let is_dir = resource?.customMetadata?.resourcetype === '<collection />';
+	let is_dir = is_implicit_collection || resource?.customMetadata?.resourcetype === '<collection />';
 
 	if (is_dir) {
 		let depth = request.headers.get('Depth') ?? 'infinity';
@@ -1418,7 +1546,11 @@ async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response
 						});
 					}
 				};
-				let promise_array = [copy(resource)];
+				// An implicit collection has no marker object to copy, so write an
+				// explicit one at the destination: a COPY must preserve the resource
+				// type (RFC 4918 §15.9 COPY/MOVE behavior).
+				let promise_array: Promise<void>[] =
+					resource !== null ? [copy(resource)] : [writeCollectionMarker(bucket, destination)];
 				for await (let object of listAll(bucket, prefix, true)) {
 					promise_array.push(copy(object));
 				}
@@ -1430,14 +1562,18 @@ async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response
 				}
 			}
 			case '0': {
-				let object = await bucket.get(resource.key);
-				if (object === null) {
-					return new Response('Not Found', { status: 404 });
+				if (resource === null) {
+					await writeCollectionMarker(bucket, destination);
+				} else {
+					let object = await bucket.get(resource.key);
+					if (object === null) {
+						return new Response('Not Found', { status: 404 });
+					}
+					await bucket.put(destination, object.body, {
+						httpMetadata: object.httpMetadata,
+						customMetadata: stripLockMetadata(object.customMetadata),
+					});
 				}
-				await bucket.put(destination, object.body, {
-					httpMetadata: object.httpMetadata,
-					customMetadata: stripLockMetadata(object.customMetadata),
-				});
 				if (destination_exists) {
 					return new Response(null, { status: 204 });
 				} else {
@@ -1449,6 +1585,11 @@ async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response
 			}
 		}
 	} else {
+		if (resource === null) {
+			// Unreachable: a missing marker object means an implicit collection, so
+			// is_dir would be true. Kept so the type checker can narrow `resource`.
+			return new Response('Not Found', { status: 404 });
+		}
 		let src = await bucket.get(resource.key);
 		if (src === null) {
 			return new Response('Not Found', { status: 404 });
@@ -1501,10 +1642,14 @@ async function handle_move(request: Request, bucket: R2Bucket): Promise<Response
 	}
 
 	let resource = await bucket.head(resource_path);
+	let is_implicit_collection = false;
 	if (resource === null) {
-		return new Response('Not Found', { status: 404 });
-	}
-	if (resource.key === destination) {
+		// A collection may exist only as a key prefix, with no marker object.
+		if (!(await hasCollectionResource(bucket, resource_path))) {
+			return new Response('Not Found', { status: 404 });
+		}
+		is_implicit_collection = true;
+	} else if (resource.key === destination) {
 		return new Response('Bad Request', { status: 400 });
 	}
 
@@ -1529,7 +1674,7 @@ async function handle_move(request: Request, bucket: R2Bucket): Promise<Response
 		}
 	}
 
-	let is_dir = resource?.customMetadata?.resourcetype === '<collection />';
+	let is_dir = is_implicit_collection || resource?.customMetadata?.resourcetype === '<collection />';
 
 	if (is_dir) {
 		let depth = request.headers.get('Depth') ?? 'infinity';
@@ -1548,7 +1693,11 @@ async function handle_move(request: Request, bucket: R2Bucket): Promise<Response
 						await bucket.delete(object.key);
 					}
 				};
-				let promise_array = [move(resource)];
+				// An implicit collection has no marker object to move, so write an
+				// explicit one at the destination: a MOVE must preserve the resource
+				// type (RFC 4918 §15.9 COPY/MOVE behavior).
+				let promise_array: Promise<void>[] =
+					resource !== null ? [move(resource)] : [writeCollectionMarker(bucket, destination)];
 				for await (let object of listAll(bucket, prefix, true)) {
 					promise_array.push(move(object));
 				}
@@ -1564,6 +1713,11 @@ async function handle_move(request: Request, bucket: R2Bucket): Promise<Response
 			}
 		}
 	} else {
+		if (resource === null) {
+			// Unreachable: a missing marker object means an implicit collection, so
+			// is_dir would be true. Kept so the type checker can narrow `resource`.
+			return new Response('Not Found', { status: 404 });
+		}
 		let src = await bucket.get(resource.key);
 		if (src === null) {
 			return new Response('Not Found', { status: 404 });
