@@ -845,6 +845,50 @@ function extractLockOwner(body: string): string | undefined {
 	return owner === '' ? undefined : owner;
 }
 
+/**
+ * Last path segment of a key: the resource's own name.
+ */
+function getKeyName(key: string): string {
+	return key.split('/').pop() ?? key;
+}
+
+/**
+ * Extracts the file name suggested by a Content-Disposition header.
+ *
+ * R2 stores the header verbatim, so it reads like
+ * `attachment; filename="report.pdf"`. Returns null when the header is absent
+ * or carries no usable filename parameter.
+ */
+function parseContentDispositionFilename(contentDisposition: string | undefined): string | null {
+	if (contentDisposition === undefined) {
+		return null;
+	}
+
+	// RFC 6266 fixes the syntax but not the parameter order, and the value is
+	// either a quoted string (which may contain backslash escapes) or a bare
+	// token.
+	let match = contentDisposition.match(/;\s*filename\s*=\s*(?:"((?:[^"\\]|\\.)*)"|([^;\s]+))/i);
+	if (match === null) {
+		return null;
+	}
+
+	let filename = (match[1] ?? match[2] ?? '').replace(/\\(.)/g, '$1').trim();
+	return filename === '' ? null : filename;
+}
+
+/**
+ * Name of a resource as it should be shown to a user.
+ *
+ * Prefers the file name an uploader set through Content-Disposition, which is
+ * stored on the resource and therefore independent of the Request-URI as
+ * RFC 4918 §15.2 recommends, and otherwise falls back to the key's last path
+ * segment. The raw header is never used as-is: `attachment; filename="x.txt"`
+ * is not a name "suitable for presentation to a user".
+ */
+function getDisplayName(object: R2Object): string {
+	return parseContentDispositionFilename(object.httpMetadata?.contentDisposition) ?? getKeyName(object.key);
+}
+
 function fromR2Object(object: R2Object | null | undefined): DavProperties {
 	if (object === null || object === undefined) {
 		return {
@@ -865,7 +909,7 @@ function fromR2Object(object: R2Object | null | undefined): DavProperties {
 	let lockDetails = getLockDetails(object.customMetadata);
 	return {
 		creationdate: object.uploaded.toUTCString(),
-		displayname: object.httpMetadata?.contentDisposition,
+		displayname: getDisplayName(object),
 		getcontentlanguage: object.httpMetadata?.contentLanguage,
 		getcontentlength: object.size.toString(),
 		getcontenttype: object.httpMetadata?.contentType,
@@ -885,11 +929,11 @@ function fromR2Object(object: R2Object | null | undefined): DavProperties {
 	};
 }
 
-function getLivePropertyValue(object: R2Object | null, property: DeadProperty): string | undefined {
+function getLivePropertyValue(davProperties: DavProperties, property: DeadProperty): string | undefined {
 	if (property.namespaceURI !== DAV_NAMESPACE) {
 		return undefined;
 	}
-	return fromR2Object(object)[property.localName as keyof DavProperties];
+	return davProperties[property.localName as keyof DavProperties];
 }
 
 function renderPropstat(status: string, properties: string[]): string {
@@ -1024,7 +1068,7 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 				name = member.key.slice(prefix.length);
 			} else {
 				href = getResourceHref(member.object.key, false);
-				name = member.object.httpMetadata?.contentDisposition ?? member.object.key.slice(prefix.length);
+				name = getDisplayName(member.object);
 			}
 			page += `<a href="${escapeXml(href)}">${escapeXml(name)}</a><br>`;
 		}
@@ -1268,7 +1312,21 @@ function generate_propfind_response(
 				? getResourceHref(syntheticCollectionKey, true)
 				: '/';
 	let deadProperties = getDeadProperties(object?.customMetadata);
-	let liveProperties = Object.entries(fromR2Object(object)).flatMap(([key, value]) =>
+	// Live properties are computed once so that every propstat of this response
+	// sees the same values (a null object reports the current time, which would
+	// otherwise differ between the allprop and propname branches).
+	let davProperties: DavProperties =
+		syntheticCollectionKey === null
+			? fromR2Object(object)
+			: {
+					// An implicit collection has no object to read properties from, so it
+					// borrows the root collection's defaults and only takes its name from
+					// the key, otherwise it would be the one collection kind without a
+					// displayname.
+					...fromR2Object(null),
+					displayname: getKeyName(syntheticCollectionKey),
+				};
+	let liveProperties = Object.entries(davProperties).flatMap(([key, value]) =>
 		value === undefined ? [] : [renderDavProperty(key, value)],
 	);
 
@@ -1282,7 +1340,7 @@ function generate_propfind_response(
 		}
 		case 'propname': {
 			okProperties = [
-				...Object.entries(fromR2Object(object)).flatMap(([key, value]) =>
+				...Object.entries(davProperties).flatMap(([key, value]) =>
 					value === undefined ? [] : [renderDavProperty(key, '')],
 				),
 				...deadProperties.map((property) => renderEmptyPropertyElement({ ...property, valueXml: '' })),
@@ -1291,7 +1349,7 @@ function generate_propfind_response(
 		}
 		case 'prop': {
 			for (const property of propfindRequest.properties) {
-				let liveValue = getLivePropertyValue(object, property);
+				let liveValue = getLivePropertyValue(davProperties, property);
 				if (liveValue !== undefined) {
 					okProperties.push(renderDavProperty(property.localName, liveValue));
 					continue;

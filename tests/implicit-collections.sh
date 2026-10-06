@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
 #
-# Regression tests for WebDAV access to implicit R2 collections.
+# Local regression tests for r2-webdav.
 #
-# An implicit collection is a directory that exists only as a key prefix: for
-# example `photos/deep.txt` written straight into R2 by the dashboard, the S3
-# API or `wrangler r2 object put`. No marker object was ever created for
-# `photos/`, yet RFC 4918 §5.2 requires that collection to exist.
+# Two areas are covered:
 #
-# litmus never creates such a layout (it always uses MKCOL), so these cases need
-# their own suite. See docs/2026-10-06-implicit-collection-plan.md.
+#   1. Implicit R2 collections (sections 1-11). An implicit collection is a
+#      directory that exists only as a key prefix: for example
+#      `photos/deep.txt` written straight into R2 by the dashboard, the S3 API
+#      or `wrangler r2 object put`. No marker object was ever created for
+#      `photos/`, yet RFC 4918 §5.2 requires that collection to exist.
+#      See docs/2026-10-06-implicit-collection-plan.md.
+#
+#   2. DAV:displayname derivation (section 12), see docs/CHANGES-20261006.md.
+#
+# litmus never creates these layouts (it always uses MKCOL, and it never sets a
+# Content-Disposition header), so these cases need their own suite.
 #
 # Usage:
 #   bash tests/implicit-collections.sh
@@ -104,8 +110,12 @@ wrangler_r2() {
 # Writes an object straight into R2, bypassing WebDAV: this is the whole point
 # of the suite, MKCOL must NOT be involved.
 put_direct() {
-	local key="$1" file="$2"
-	wrangler_r2 object put "$BUCKET/$key" --file="$file" --local
+	local key="$1" file="$2" content_disposition="${3:-}"
+	if [[ -n "$content_disposition" ]]; then
+		wrangler_r2 object put "$BUCKET/$key" --file="$file" --content-disposition "$content_disposition" --local
+	else
+		wrangler_r2 object put "$BUCKET/$key" --file="$file" --local
+	fi
 }
 
 dav() {
@@ -125,6 +135,19 @@ dav_status() {
 
 hrefs() {
 	printf '%s' "$1" | grep -o '<href>[^<]*</href>' | sed 's|<href>||; s|</href>||'
+}
+
+# Raw PROPFIND response asking only for DAV:displayname.
+displayname_response() {
+	curl -sS -u "$TEST_USERNAME:$TEST_PASSWORD" -X PROPFIND \
+		-H 'Depth: 0' -H 'Content-Type: application/xml' \
+		--data '<propfind xmlns="DAV:"><prop><displayname/></prop></propfind>' \
+		"$DAV_URL$1"
+}
+
+# Value of DAV:displayname, empty when the server reports it as 404.
+displayname() {
+	displayname_response "$1" | sed -n 's/^[[:space:]]*<displayname>\(.*\)<\/displayname>[[:space:]]*$/\1/p'
 }
 
 # --- start a server if needed ------------------------------------------------
@@ -242,6 +265,36 @@ put_direct "$PREFIX/clash/inner.txt" "$WORKDIR/file.txt"
 clash_listing="$(hrefs "$(dav PROPFIND "/$PREFIX/" -H 'Depth: 1')")"
 check "11a. the plain object is reported once" "$(printf '%s\n' "$clash_listing" | grep -c "^/$PREFIX/clash$")" "1"
 check_absent "11b. no same-named collection is reported" "$clash_listing" "/$PREFIX/clash/"
+
+# --- 12. DAV:displayname ------------------------------------------------------
+
+put_direct "$PREFIX/plain-name.txt" "$WORKDIR/file.txt"
+check "12a. object without Content-Disposition is named by its key" \
+	"$(displayname "/$PREFIX/plain-name.txt")" "plain-name.txt"
+
+put_direct "$PREFIX/opaque-hash" "$WORKDIR/file.txt" 'attachment; filename="report 2026.pdf"'
+quoted_name="$(displayname "/$PREFIX/opaque-hash")"
+check "12b. quoted filename is extracted from Content-Disposition" "$quoted_name" "report 2026.pdf"
+check_absent "12c. the raw Content-Disposition value is never exposed" \
+	"$(displayname_response "/$PREFIX/opaque-hash")" "attachment"
+
+put_direct "$PREFIX/bare-token-hash" "$WORKDIR/file.txt" 'inline; filename=bare-token.txt'
+check "12d. bare token filename is extracted" "$(displayname "/$PREFIX/bare-token-hash")" "bare-token.txt"
+
+put_direct "$PREFIX/no-filename-hash" "$WORKDIR/file.txt" 'attachment'
+check "12e. header without a filename parameter falls back to the key" \
+	"$(displayname "/$PREFIX/no-filename-hash")" "no-filename-hash"
+
+dav_status MKCOL "/$PREFIX/named-dir/" >/dev/null
+check "12f. explicit collection is named after the key" \
+	"$(displayname "/$PREFIX/named-dir/")" "named-dir"
+
+put_direct "$PREFIX/named-implicit/inner.txt" "$WORKDIR/file.txt"
+check "12g. implicit collection is named after the key" \
+	"$(displayname "/$PREFIX/named-implicit/")" "named-implicit"
+
+check_absent "12h. the root collection still reports no displayname" \
+	"$(displayname_response '/')" "<displayname>"
 
 # --- summary -----------------------------------------------------------------
 
