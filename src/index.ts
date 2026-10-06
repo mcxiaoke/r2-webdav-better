@@ -546,6 +546,205 @@ function hasAlwaysFalseIfCondition(request: Request): boolean {
 	return ifHeader.includes('<DAV:no-lock>') && !ifHeader.includes('Not <DAV:no-lock>');
 }
 
+interface IfCondition {
+	negate: boolean;
+	// <urn:uuid:...> / <DAV:no-lock> state token (normalized)
+	token?: string;
+	// ["..."] / [W/"..."] entity tag, kept with quotes
+	entityTag?: string;
+}
+
+interface IfList {
+	// <http://host/path> resource tag; undefined for a no-tag list
+	resourceTag?: string;
+	conditions: IfCondition[];
+}
+
+// RFC 4918 §10.4 If header lexer: <...> (state token / resource tag),
+// [...] (entity tag), "(" ")" list delimiters and the Not keyword.
+function lexIfHeader(
+	header: string,
+): Array<{ kind: 'token' | 'entityTag' | 'listStart' | 'listEnd' | 'not'; value?: string }> | null {
+	const tokens: Array<{ kind: 'token' | 'entityTag' | 'listStart' | 'listEnd' | 'not'; value?: string }> = [];
+	let index = 0;
+	while (index < header.length) {
+		const ch = header[index];
+		if (ch === ' ' || ch === '\t' || ch === '\r' || ch === '\n') {
+			index++;
+			continue;
+		}
+		if (ch === '(') {
+			tokens.push({ kind: 'listStart' });
+			index++;
+			continue;
+		}
+		if (ch === ')') {
+			tokens.push({ kind: 'listEnd' });
+			index++;
+			continue;
+		}
+		if (ch === '<') {
+			const end = header.indexOf('>', index);
+			if (end === -1) {
+				return null;
+			}
+			tokens.push({ kind: 'token', value: header.slice(index + 1, end) });
+			index = end + 1;
+			continue;
+		}
+		if (ch === '[') {
+			const end = header.indexOf(']', index);
+			if (end === -1) {
+				return null;
+			}
+			tokens.push({ kind: 'entityTag', value: header.slice(index + 1, end).trim() });
+			index = end + 1;
+			continue;
+		}
+		if (/^not[\s(]/i.test(header.slice(index))) {
+			tokens.push({ kind: 'not' });
+			index += 3;
+			continue;
+		}
+		return null;
+	}
+	return tokens;
+}
+
+// Grammar: 1*No-tag-list | 1*Tagged-list; a bare state token outside a list
+// (sent by some legacy clients) is tolerated as a single-condition list.
+function parseIfHeader(header: string): IfList[] | null {
+	const tokens = lexIfHeader(header);
+	if (tokens === null) {
+		return null;
+	}
+
+	const lists: IfList[] = [];
+	let pendingResourceTag: string | undefined;
+	let index = 0;
+	while (index < tokens.length) {
+		const tok = tokens[index];
+		if (tok.kind === 'listStart') {
+			const conditions: IfCondition[] = [];
+			index++;
+			let negate = false;
+			while (index < tokens.length && tokens[index].kind !== 'listEnd') {
+				const inner = tokens[index];
+				if (inner.kind === 'not') {
+					negate = true;
+					index++;
+					continue;
+				}
+				if (inner.kind === 'token') {
+					conditions.push({ negate, token: normalizeLockToken(inner.value!) });
+					negate = false;
+					index++;
+					continue;
+				}
+				if (inner.kind === 'entityTag') {
+					conditions.push({ negate, entityTag: inner.value });
+					negate = false;
+					index++;
+					continue;
+				}
+				return null;
+			}
+			if (tokens[index]?.kind !== 'listEnd' || conditions.length === 0) {
+				return null;
+			}
+			index++;
+			lists.push({ resourceTag: pendingResourceTag, conditions });
+			pendingResourceTag = undefined;
+			continue;
+		}
+		if (tok.kind === 'token') {
+			// A "<...>" followed by a list is a resource tag; otherwise it is a
+			// bare state token (legacy form).
+			if (tokens[index + 1]?.kind === 'listStart') {
+				pendingResourceTag = tok.value;
+			} else {
+				lists.push({ conditions: [{ negate: false, token: normalizeLockToken(tok.value!) }] });
+			}
+			index++;
+			continue;
+		}
+		return null;
+	}
+	return lists;
+}
+
+function entityTagMatches(objectEtag: string | undefined, headerEntityTag: string): boolean {
+	if (objectEtag === undefined) {
+		return false;
+	}
+	const strip = (value: string) =>
+		value
+			.trim()
+			.replace(/^W\//i, '')
+			.replace(/^"(.*)"$/, '$1');
+	return strip(objectEtag) === strip(headerEntityTag);
+}
+
+function resourcePathFromResourceTag(resourceTag: string): string | null {
+	try {
+		return decodeResourcePath(new URL(resourceTag).pathname);
+	} catch {
+		return null;
+	}
+}
+
+// RFC 4918 §10.4: a list evaluates to true when every condition holds
+// (token present on the resource, entity tag matching, each possibly
+// negated); the whole header is true when at least one list is true.
+async function evaluateIfHeader(
+	request: Request,
+	bucket: R2Bucket,
+	resourcePath: string,
+	requestObject: R2Object | null,
+): Promise<boolean> {
+	const header = request.headers.get('If');
+	if (header === null || header.trim() === '') {
+		return true;
+	}
+	const lists = parseIfHeader(header);
+	if (lists === null) {
+		// Unparseable header: do not reject on it (lock checks still apply).
+		return true;
+	}
+
+	for (const list of lists) {
+		let object = requestObject;
+		if (list.resourceTag !== undefined) {
+			const taggedPath = resourcePathFromResourceTag(list.resourceTag);
+			if (taggedPath === null) {
+				continue;
+			}
+			object = taggedPath === resourcePath ? requestObject : await bucket.head(taggedPath);
+		}
+		let listTrue = true;
+		for (const condition of list.conditions) {
+			let satisfied: boolean;
+			if (condition.token !== undefined) {
+				const activeTokens = getLockDetails(object?.customMetadata).map((detail) => detail.token);
+				satisfied = activeTokens.includes(condition.token);
+			} else {
+				satisfied = object !== null && entityTagMatches(object.etag, condition.entityTag!);
+			}
+			if (condition.negate) {
+				satisfied = !satisfied;
+			}
+			if (!satisfied) {
+				listTrue = false;
+				break;
+			}
+		}
+		if (listTrue) {
+			return true;
+		}
+	}
+	return false;
+}
+
 function timingSafeEqual(left: Uint8Array, right: Uint8Array): boolean {
 	if (left.byteLength !== right.byteLength) {
 		return false;
@@ -775,6 +974,9 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 				status: rangeRequested ? 206 : 200,
 				headers: {
 					'Accept-Ranges': 'bytes',
+					// httpEtag is the object's etag in quotes, ready for a header.
+					// Clients rely on it for If-Match optimistic concurrency on PUT.
+					'ETag': object.httpEtag,
 					'Content-Type': object.httpMetadata?.contentType ?? 'application/octet-stream',
 					'Content-Length': contentLength.toString(),
 					...(rangeRequested ? { 'Content-Range': `bytes ${rangeOffset}-${rangeEnd}/${object.size}` } : {}),
@@ -839,6 +1041,13 @@ async function handle_put(request: Request, bucket: R2Bucket): Promise<Response>
 	}
 	let existing = await bucket.head(resource_path);
 
+	// RFC 4918 §10.4: evaluate the WebDAV If header (lock tokens + entity
+	// tags). R2 only understands HTTP conditional headers (If-Match etc.),
+	// so the If header must be enforced here before writing.
+	if (!(await evaluateIfHeader(request, bucket, resource_path, existing))) {
+		return new Response('Precondition Failed', { status: 412 });
+	}
+
 	// Check if the parent directory exists
 	let dirpath = getParentPath(resource_path);
 	if (!(await hasCollectionResource(bucket, dirpath))) {
@@ -846,12 +1055,20 @@ async function handle_put(request: Request, bucket: R2Bucket): Promise<Response>
 	}
 
 	let body = await request.arrayBuffer();
-	await bucket.put(resource_path, body, {
+	// R2 returns null (and stores nothing) when a conditional request header
+	// such as If-Match / If-None-Match fails its precondition.
+	let written = await bucket.put(resource_path, body, {
 		onlyIf: request.headers,
 		httpMetadata: request.headers,
 		customMetadata: getPreservedCustomMetadata(existing?.customMetadata),
 	});
-	return existing === null ? new Response('', { status: 201 }) : new Response(null, { status: 204 });
+	if (written === null) {
+		return new Response('Precondition Failed', { status: 412 });
+	}
+	return new Response(existing === null ? '' : null, {
+		status: existing === null ? 201 : 204,
+		headers: { 'ETag': written.httpEtag },
+	});
 }
 
 async function handle_delete(request: Request, bucket: R2Bucket): Promise<Response> {
