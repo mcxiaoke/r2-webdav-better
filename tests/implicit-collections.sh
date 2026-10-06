@@ -13,6 +13,9 @@
 #
 #   2. DAV:displayname derivation (section 12), see docs/CHANGES-20261006.md.
 #
+#   3. Conditional GET status codes (section 13, RFC 9110 §13.2.2): a failed
+#      If-None-Match / If-Modified-Since on GET/HEAD must answer 304, not 412.
+#
 # litmus never creates these layouts (it always uses MKCOL, and it never sets a
 # Content-Disposition header), so these cases need their own suite.
 #
@@ -97,6 +100,15 @@ check_absent() {
 	fi
 }
 
+check_nonempty() {
+	local label="$1" value="$2"
+	if [[ -n "$value" ]]; then
+		ok "$label"
+	else
+		no "$label" "value is empty"
+	fi
+}
+
 # --- helpers -----------------------------------------------------------------
 
 wrangler_r2() {
@@ -135,6 +147,12 @@ dav_status() {
 
 hrefs() {
 	printf '%s' "$1" | grep -o '<href>[^<]*</href>' | sed 's|<href>||; s|</href>||'
+}
+
+# ETag of a resource over a plain GET, empty when the server sends none.
+etag_of() {
+	curl -sS -o /dev/null -D - -u "$TEST_USERNAME:$TEST_PASSWORD" "$DAV_URL$1" |
+		tr -d '\r' | awk 'tolower($1) == "etag:" { print $2 }'
 }
 
 # Raw PROPFIND response asking only for DAV:displayname.
@@ -295,6 +313,33 @@ check "12g. implicit collection is named after the key" \
 
 check_absent "12h. the root collection still reports no displayname" \
 	"$(displayname_response '/')" "<displayname>"
+
+# --- 13. conditional GET (RFC 9110 §13.2.2) -----------------------------------
+# R2 returns a body-less object when a conditional header is unsatisfied; the
+# status code is then chosen by r2-webdav. If-None-Match / If-Modified-Since on
+# GET/HEAD must map to 304, otherwise HTTP caches and caching proxies that
+# revalidate a stored response see a hard failure instead of a usable answer.
+
+put_direct "$PREFIX/cond.txt" "$WORKDIR/file.txt"
+COND_ETAG="$(etag_of "/$PREFIX/cond.txt")"
+check_nonempty "13a. a plain GET exposes an ETag validator" "$COND_ETAG"
+
+check "13b. GET + If-None-Match (matches) returns 304" \
+	"$(dav_status GET "/$PREFIX/cond.txt" -H "If-None-Match: $COND_ETAG")" "304"
+check "13c. GET + If-None-Match: * returns 304" \
+	"$(dav_status GET "/$PREFIX/cond.txt" -H 'If-None-Match: *')" "304"
+check "13d. GET + If-Modified-Since (not modified) returns 304" \
+	"$(dav_status GET "/$PREFIX/cond.txt" -H 'If-Modified-Since: Wed, 01 Jan 2031 00:00:00 GMT')" "304"
+check "13e. HEAD + If-None-Match (matches) returns 304" \
+	"$(curl -sS -o /dev/null -w '%{http_code}' -I -u "$TEST_USERNAME:$TEST_PASSWORD" \
+		-H "If-None-Match: $COND_ETAG" "$DAV_URL/$PREFIX/cond.txt")" "304"
+check "13f. GET + If-Match (matches) still returns 200" \
+	"$(dav_status GET "/$PREFIX/cond.txt" -H "If-Match: $COND_ETAG")" "200"
+check "13g. GET + If-Match (stale) returns 412" \
+	"$(dav_status GET "/$PREFIX/cond.txt" -H 'If-Match: "deadbeef"')" "412"
+check "13h. PUT + If-Match (stale) returns 412" \
+	"$(curl -sS -o /dev/null -w '%{http_code}' -u "$TEST_USERNAME:$TEST_PASSWORD" -T "$WORKDIR/file.txt" \
+		-H 'If-Match: "deadbeef"' "$DAV_URL/$PREFIX/cond.txt")" "412"
 
 # --- summary -----------------------------------------------------------------
 

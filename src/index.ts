@@ -1041,6 +1041,47 @@ async function handle_head(request: Request, bucket: R2Bucket): Promise<Response
 	});
 }
 
+/**
+ * Builds the response for the case where R2's get() returned a body-less
+ * R2Object, i.e. a conditional request header was not satisfied.
+ *
+ * R2 only reports that *some* precondition failed, so the status code has to be
+ * chosen here. RFC 9110 §13.2.2 evaluates the headers in order and maps them
+ * differently depending on the method:
+ *
+ *   - If-Match / If-Unmodified-Since unsatisfied       -> 412 Precondition Failed
+ *   - If-None-Match unsatisfied on GET/HEAD            -> 304 Not Modified
+ *   - If-Modified-Since unsatisfied on GET/HEAD        -> 304 Not Modified
+ *
+ * This matters because HTTP caches and caching proxies revalidate a stored
+ * response with If-None-Match and rely on the 304 to reuse it. Answering 412
+ * instead makes them surface a hard failure to the client, even though nothing
+ * is wrong with the request.
+ */
+function conditionalGetResponse(object: R2Object, request: Request): Response {
+	let headers = new Headers({
+		// Validators the client needs in order to revalidate again later.
+		ETag: object.httpEtag,
+		'Last-Modified': object.uploaded.toUTCString(),
+	});
+	if (object.httpMetadata?.cacheControl !== undefined) {
+		headers.set('Cache-Control', object.httpMetadata.cacheControl);
+	}
+
+	let isGetOrHead = request.method === 'GET' || request.method === 'HEAD';
+	// If-Match and If-Unmodified-Since are evaluated before If-None-Match and
+	// only ever map to 412.
+	let failedFirstCondition = request.headers.has('If-Match') || request.headers.has('If-Unmodified-Since');
+	let failedNotModified =
+		request.headers.has('If-None-Match') || (isGetOrHead && request.headers.has('If-Modified-Since'));
+
+	if (isGetOrHead && !failedFirstCondition && failedNotModified) {
+		// A 304 must not carry a body, and must not carry a Content-Length.
+		return new Response(null, { status: 304, headers: headers });
+	}
+	return new Response('Precondition Failed', { status: 412, headers: headers });
+}
+
 async function handle_get(request: Request, bucket: R2Bucket): Promise<Response> {
 	let resource_path = make_resource_path(request);
 
@@ -1092,7 +1133,7 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 		if (object === null) {
 			return new Response('Not Found', { status: 404 });
 		} else if (!isR2ObjectBody(object)) {
-			return new Response('Precondition Failed', { status: 412 });
+			return conditionalGetResponse(object, request);
 		} else {
 			const { rangeOffset, rangeEnd } = calcContentRange(object);
 			const contentLength = rangeEnd - rangeOffset + 1;
